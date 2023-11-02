@@ -94,6 +94,7 @@ extern unsigned long transparent_hugepage_flags;
 
 static inline bool transparent_hugepage_enabled(struct vm_area_struct *vma)
 {
+#if 0
 	if (vma->vm_flags & VM_NOHUGEPAGE)
 		return false;
 
@@ -112,6 +113,7 @@ static inline bool transparent_hugepage_enabled(struct vm_area_struct *vma)
 	if (transparent_hugepage_flags &
 				(1 << TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG))
 		return !!(vma->vm_flags & VM_HUGEPAGE);
+#endif
 
 	return false;
 }

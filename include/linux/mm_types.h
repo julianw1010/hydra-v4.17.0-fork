@@ -74,6 +74,7 @@ struct hmm;
 #define _struct_page_alignment
 #define _slub_counter_t		unsigned int
 #endif /* !CONFIG_HAVE_ALIGNED_STRUCT_PAGE */
+#define NUMA_NODE_COUNT CONFIG_HYDRA_NUMA_NODES
 
 struct page {
 	/* First double word block */
@@ -213,6 +214,8 @@ struct page {
 					   not kmapped, ie. highmem) */
 #endif /* WANT_PAGE_VIRTUAL */
 
+struct page *next_replica;
+
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 	int _last_cpupid;
 #endif
@@ -298,6 +301,7 @@ struct vm_area_struct {
 	struct mm_struct *vm_mm;	/* The address space we belong to. */
 	pgprot_t vm_page_prot;		/* Access permissions of this VMA. */
 	unsigned long vm_flags;		/* Flags, see mm.h. */
+	unsigned long  master_pgd_node;
 
 	/*
 	 * For areas with an address space and backing store,
@@ -367,7 +371,17 @@ struct mm_struct {
 #endif
 	unsigned long task_size;		/* size of task vm space */
 	unsigned long highest_vm_end;		/* highest vma end address */
+
+	bool          lazy_repl_enabled;
+	int           va_segregation_mode;
+	pgd_t * repl_pgd[NUMA_NODE_COUNT];
 	pgd_t * pgd;
+#ifdef CONFIG_HYDRA_TLB_STATISTICS
+	atomic64_t xx_tlb_total;
+	atomic64_t xx_tlb_sent;
+	atomic64_t xx_flush_total;
+	atomic64_t xx_flush_nodes;
+#endif
 
 	/**
 	 * @mm_users: The number of users including userspace.

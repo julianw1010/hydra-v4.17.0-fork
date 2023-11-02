@@ -951,6 +951,8 @@ static inline int pgd_none(pgd_t pgd)
  * a shortcut to get a pgd_t in a given mm
  */
 #define pgd_offset(mm, address) pgd_offset_pgd((mm)->pgd, (address))
+
+#define pgd_offset_node(mm, address, node) pgd_offset_pgd((mm)->repl_pgd[(node)], (address))
 /*
  * a shortcut which implies the use of the kernel's pgd, instead
  * of a process's
@@ -1052,37 +1054,20 @@ extern int ptep_clear_flush_young(struct vm_area_struct *vma,
 				  unsigned long address, pte_t *ptep);
 
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
-static inline pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
-				       pte_t *ptep)
-{
-	pte_t pte = native_ptep_get_and_clear(ptep);
-	return pte;
-}
+pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
+				       pte_t *ptep);
 
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR_FULL
 static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
 					    unsigned long addr, pte_t *ptep,
 					    int full)
 {
-	pte_t pte;
-	if (full) {
-		/*
-		 * Full address destruction in progress; paravirt does not
-		 * care about updates and native needs no locking
-		 */
-		pte = native_local_ptep_get_and_clear(ptep);
-	} else {
-		pte = ptep_get_and_clear(mm, addr, ptep);
-	}
-	return pte;
+	return ptep_get_and_clear(mm, addr, ptep);
 }
 
 #define __HAVE_ARCH_PTEP_SET_WRPROTECT
-static inline void ptep_set_wrprotect(struct mm_struct *mm,
-				      unsigned long addr, pte_t *ptep)
-{
-	clear_bit(_PAGE_BIT_RW, (unsigned long *)&ptep->pte);
-}
+void ptep_set_wrprotect(struct mm_struct *mm,
+				      unsigned long addr, pte_t *ptep);
 
 #define flush_tlb_fix_spurious_fault(vma, address) do { } while (0)
 
@@ -1167,6 +1152,9 @@ static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
  */
 static inline void clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
 {
+	// printk("Copying from src: %x to dst: %x \n",src, dst);
+	// printk("before dst: %x\n", dst[0]);
+	// printk("before src: %x\n", src[0]);
 	memcpy(dst, src, count * sizeof(pgd_t));
 #ifdef CONFIG_PAGE_TABLE_ISOLATION
 	if (!static_cpu_has(X86_FEATURE_PTI))
@@ -1174,6 +1162,8 @@ static inline void clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
 	/* Clone the user space pgd as well */
 	memcpy(kernel_to_user_pgdp(dst), kernel_to_user_pgdp(src),
 	       count * sizeof(pgd_t));
+	// printk("after dst: %x\n", dst[0]);
+	// printk("after src: %x\n", src[0]);
 #endif
 }
 
@@ -1319,6 +1309,11 @@ static inline bool pud_access_permitted(pud_t pud, bool write)
 {
 	return __pte_access_permitted(pud_val(pud), write);
 }
+
+void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval);
+pte_t pgtable_repl_get_pte(pte_t *ptep);
+void pgtable_repl_set_pte_at(struct mm_struct *mm, unsigned long addr, pte_t *ptep, pte_t pteval);
+void init_lazy_pgtabls_repl(void);
 
 #include <asm-generic/pgtable.h>
 #endif	/* __ASSEMBLY__ */

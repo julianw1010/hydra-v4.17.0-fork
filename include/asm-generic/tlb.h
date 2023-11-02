@@ -101,13 +101,16 @@ struct mmu_gather {
 	unsigned int		fullmm : 1,
 	/* we have performed an operation which
 	 * requires a complete flush of the tlb */
-				need_flush_all : 1;
+				need_flush_all : 1,
+				collect_nodemask : 1;
 
 	struct mmu_gather_batch *active;
 	struct mmu_gather_batch	local;
 	struct page		*__pages[MMU_GATHER_BUNDLE];
 	unsigned int		batch_count;
 	int page_size;
+	struct vm_area_struct *vma;
+	nodemask_t nodemask;
 };
 
 #define HAVE_GENERIC_MMU_GATHER

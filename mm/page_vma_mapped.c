@@ -143,7 +143,7 @@ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw)
 		return true;
 	}
 restart:
-	pgd = pgd_offset(mm, pvmw->address);
+	pgd = mm->lazy_repl_enabled ? pgd_offset_node(mm, pvmw->address, pvmw->vma->master_pgd_node) : pgd_offset(mm, pvmw->address);
 	if (!pgd_present(*pgd))
 		return false;
 	p4d = p4d_offset(pgd, pvmw->address);

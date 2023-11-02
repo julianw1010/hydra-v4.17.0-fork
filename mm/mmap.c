@@ -49,6 +49,7 @@
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
 #include <asm/tlb.h>
+#include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
 
 #include "internal.h"
@@ -1034,6 +1035,12 @@ can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
 		     pgoff_t vm_pgoff,
 		     struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 {
+	struct mm_struct *mm = vma->vm_mm;
+
+	if (mm->lazy_repl_enabled && (vma->master_pgd_node != numa_node_id())) {
+		return 0;
+	}
+
 	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
 		if (vma->vm_pgoff == vm_pgoff)
@@ -1055,6 +1062,12 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
 		    pgoff_t vm_pgoff,
 		    struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 {
+	struct mm_struct *mm = vma->vm_mm;
+
+	if (mm->lazy_repl_enabled && (vma->master_pgd_node != numa_node_id())) {
+		return 0;
+	}
+
 	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
 		pgoff_t vm_pglen;
@@ -1064,6 +1077,7 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
 	}
 	return 0;
 }
+
 
 /*
  * Given a mapping request (addr,end,vm_flags,file,pgoff), figure out
@@ -1741,6 +1755,11 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	vma->vm_flags = vm_flags;
 	vma->vm_page_prot = vm_get_page_prot(vm_flags);
 	vma->vm_pgoff = pgoff;
+	if (mm->lazy_repl_enabled) {
+		vma->master_pgd_node = numa_node_id();
+	} else {
+		vma->master_pgd_node = 0;
+	}
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
 
 	if (file) {
@@ -2566,6 +2585,10 @@ static void unmap_region(struct mm_struct *mm,
 
 	lru_add_drain();
 	tlb_gather_mmu(&tlb, mm, start, end);
+	if (mm->lazy_repl_enabled && sysctl_hydra_tlbflush_opt) {
+		tlb.collect_nodemask = 1;
+		nodes_clear(tlb.nodemask);
+	}
 	update_hiwater_rss(mm);
 	unmap_vmas(&tlb, vma, start, end);
 	free_pgtables(&tlb, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,

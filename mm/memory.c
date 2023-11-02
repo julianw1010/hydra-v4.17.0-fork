@@ -69,6 +69,8 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/dax.h>
 #include <linux/oom.h>
+#include <linux/hydra_debug.h>
+#include <linux/hydra_util.h>
 
 #include <asm/io.h>
 #include <asm/mmu_context.h>
@@ -91,6 +93,10 @@ EXPORT_SYMBOL(max_mapnr);
 
 struct page *mem_map;
 EXPORT_SYMBOL(mem_map);
+#endif
+
+#if defined(CONFIG_X86) && defined(CONFIG_SYSCTL)
+int sysctl_hydra_repl_order __read_mostly = 0;
 #endif
 
 /*
@@ -229,6 +235,8 @@ void arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
 	tlb->local.max  = ARRAY_SIZE(tlb->__pages);
 	tlb->active     = &tlb->local;
 	tlb->batch_count = 0;
+	tlb->collect_nodemask = 0;
+	tlb->vma = NULL;
 
 #ifdef CONFIG_HAVE_RCU_TABLE_FREE
 	tlb->batch = NULL;
@@ -551,9 +559,10 @@ static inline void free_p4d_range(struct mmu_gather *tlb, pgd_t *pgd,
 /*
  * This function frees user-level page tables of a process.
  */
-void free_pgd_range(struct mmu_gather *tlb,
+static void free_pgd_range_base(struct mmu_gather *tlb,
 			unsigned long addr, unsigned long end,
-			unsigned long floor, unsigned long ceiling)
+			unsigned long floor, unsigned long ceiling,
+			pgd_t *pgd_base)
 {
 	pgd_t *pgd;
 	unsigned long next;
@@ -604,7 +613,7 @@ void free_pgd_range(struct mmu_gather *tlb,
 	 * (see pte_free_tlb()), flush the tlb if we need
 	 */
 	tlb_remove_check_page_size_change(tlb, PAGE_SIZE);
-	pgd = pgd_offset(tlb->mm, addr);
+	pgd = pgd_offset_pgd(pgd_base, addr);
 	do {
 		next = pgd_addr_end(addr, end);
 		if (pgd_none_or_clear_bad(pgd))
@@ -613,10 +622,18 @@ void free_pgd_range(struct mmu_gather *tlb,
 	} while (pgd++, addr = next, addr != end);
 }
 
+void free_pgd_range(struct mmu_gather *tlb,
+			unsigned long addr, unsigned long end,
+			unsigned long floor, unsigned long ceiling)
+{
+	free_pgd_range_base(tlb, addr, end, floor, ceiling, tlb->mm->pgd);
+}
+
 void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		unsigned long floor, unsigned long ceiling)
 {
 	while (vma) {
+		int i;
 		struct vm_area_struct *next = vma->vm_next;
 		unsigned long addr = vma->vm_start;
 
@@ -641,8 +658,16 @@ void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *vma,
 				unlink_anon_vmas(vma);
 				unlink_file_vma(vma);
 			}
-			free_pgd_range(tlb, addr, vma->vm_end,
-				floor, next ? next->vm_start : ceiling);
+
+			if (tlb->mm->lazy_repl_enabled) {
+				for (i = 0; i < NUMA_NODE_COUNT; i++) {
+					free_pgd_range_base(tlb, addr, vma->vm_end,
+						floor, next ? next->vm_start : ceiling, tlb->mm->repl_pgd[i]);
+				}
+			} else {
+				free_pgd_range(tlb, addr, vma->vm_end,
+						floor, next ? next->vm_start : ceiling);
+			}
 		}
 		vma = next;
 	}
@@ -680,6 +705,59 @@ int __pte_alloc(struct mm_struct *mm, pmd_t *pmd, unsigned long address)
 	if (new)
 		pte_free(mm, new);
 	return 0;
+}
+
+int __repl_pte_alloc(struct mm_struct *mm, pmd_t *pmd, unsigned long address, pte_t *master_ptep, size_t nid)
+{
+	spinlock_t *ptl;
+	pgtable_t new = repl_pte_alloc_one(mm, address, nid);
+	struct page *master_pte_page, *repl_pte_page, *next_repl;
+	int allocated = 0;
+
+	if (!new)
+		return -ENOMEM;
+
+	/*
+	 * Ensure all pte setup (eg. pte page lock and page clearing) are
+	 * visible before the pte is made visible to other CPUs by being
+	 * put into page tables.
+	 *
+	 * The other side of the story is the pointer chasing in the page
+	 * table walking code (when walking the page table without locking;
+	 * ie. most of the time). Fortunately, these data accesses consist
+	 * of a chain of data-dependent loads, meaning most CPUs (alpha
+	 * being the notable exception) will already guarantee loads are
+	 * seen in-order. See the alpha page table accessors for the
+	 * smp_read_barrier_depends() barriers in page table walking code.
+	 */
+	smp_wmb(); /* Could be smp_wmb__xxx(before|after)_spin_lock */
+
+	ptl = pmd_lock(mm, pmd);
+	if (likely(pmd_none(*pmd))) {	/* Has another populated it ? */
+		mm_inc_nr_ptes(mm);
+		pmd_populate(mm, pmd, new);
+		new = NULL;
+	}
+	spin_unlock(ptl);
+
+	if (new) {
+		pte_free(mm, new);
+	} else {
+		allocated = 1;
+		master_pte_page = virt_to_page((long) master_ptep);
+		repl_pte_page = virt_to_page((long)pte_offset_map(pmd, address));
+
+		while (1) {
+			next_repl = master_pte_page->next_replica;
+			repl_pte_page->next_replica =
+				next_repl ? next_repl : master_pte_page;
+			if (cmpxchg(&master_pte_page->next_replica, next_repl,
+				    repl_pte_page) == next_repl) {
+				break;
+			}
+		}
+	}
+	return allocated;
 }
 
 int __pte_alloc_kernel(pmd_t *pmd, unsigned long address)
@@ -727,7 +805,7 @@ static inline void add_mm_rss_vec(struct mm_struct *mm, int *rss)
 static void print_bad_pte(struct vm_area_struct *vma, unsigned long addr,
 			  pte_t pte, struct page *page)
 {
-	pgd_t *pgd = pgd_offset(vma->vm_mm, addr);
+	pgd_t *pgd = vma->vm_mm->lazy_repl_enabled ? pgd_offset_node(vma->vm_mm, addr, vma->master_pgd_node) : pgd_offset(vma->vm_mm, addr);
 	p4d_t *p4d = p4d_offset(pgd, addr);
 	pud_t *pud = pud_offset(p4d, addr);
 	pmd_t *pmd = pmd_offset(pud, addr);
@@ -1261,8 +1339,17 @@ int copy_page_range(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 						    mmun_end);
 
 	ret = 0;
-	dst_pgd = pgd_offset(dst_mm, addr);
-	src_pgd = pgd_offset(src_mm, addr);
+	if (dst_mm->lazy_repl_enabled) {
+		dst_pgd = pgd_offset_node(dst_mm, addr, vma->master_pgd_node);
+	} else {
+		dst_pgd = pgd_offset(dst_mm, addr);
+	}
+
+	if (src_mm->lazy_repl_enabled) {
+		src_pgd = pgd_offset_node(src_mm, addr, vma->master_pgd_node);
+	} else {
+		src_pgd = pgd_offset(src_mm, addr);
+	}
 	do {
 		next = pgd_addr_end(addr, end);
 		if (pgd_none_or_clear_bad(src_pgd))
@@ -1286,6 +1373,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 {
 	struct mm_struct *mm = tlb->mm;
 	int force_flush = 0;
+	int marked_nodes = 0;
 	int rss[NR_MM_COUNTERS];
 	spinlock_t *ptl;
 	pte_t *start_pte;
@@ -1296,6 +1384,10 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 again:
 	init_rss_vec(rss);
 	start_pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!marked_nodes && tlb->collect_nodemask) {
+		hydra_calculate_tlbflush_nodemask(virt_to_page(start_pte), &tlb->nodemask);
+		marked_nodes = 1;
+	}
 	pte = start_pte;
 	flush_tlb_batched_pending(mm);
 	arch_enter_lazy_mmu_mode();
@@ -1501,10 +1593,15 @@ void unmap_page_range(struct mmu_gather *tlb,
 {
 	pgd_t *pgd;
 	unsigned long next;
+	struct mm_struct *mm = vma->vm_mm;
 
 	BUG_ON(addr >= end);
 	tlb_start_vma(tlb, vma);
-	pgd = pgd_offset(vma->vm_mm, addr);
+	if (mm->lazy_repl_enabled) {
+		pgd = pgd_offset_node(vma->vm_mm, addr, vma->master_pgd_node);
+	} else {
+		pgd = pgd_offset(vma->vm_mm, addr);
+	}
 	do {
 		next = pgd_addr_end(addr, end);
 		if (pgd_none_or_clear_bad(pgd))
@@ -1520,6 +1617,7 @@ static void unmap_single_vma(struct mmu_gather *tlb,
 		unsigned long end_addr,
 		struct zap_details *details)
 {
+
 	unsigned long start = max(vma->vm_start, start_addr);
 	unsigned long end;
 
@@ -1643,6 +1741,7 @@ static void zap_page_range_single(struct vm_area_struct *vma, unsigned long addr
 
 	lru_add_drain();
 	tlb_gather_mmu(&tlb, mm, address, end);
+	tlb.vma = vma;
 	update_hiwater_rss(mm);
 	mmu_notifier_invalidate_range_start(mm, address, end);
 	unmap_single_vma(&tlb, vma, address, end, details);
@@ -1696,6 +1795,29 @@ pte_t *__get_locked_pte(struct mm_struct *mm, unsigned long addr,
 	return pte_alloc_map_lock(mm, pmd, addr, ptl);
 }
 
+pte_t *__get_locked_pte_node(struct mm_struct *mm, unsigned long addr,
+			spinlock_t **ptl, int node)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+
+	pgd = pgd_offset_node(mm, addr, node);
+	p4d = p4d_alloc(mm, pgd, addr);
+	if (!p4d)
+		return NULL;
+	pud = pud_alloc(mm, p4d, addr);
+	if (!pud)
+		return NULL;
+	pmd = pmd_alloc(mm, pud, addr);
+	if (!pmd)
+		return NULL;
+
+	VM_BUG_ON(pmd_trans_huge(*pmd));
+	return pte_alloc_map_lock(mm, pmd, addr, ptl);
+}
+
 /*
  * This is the old fallback for page remapping.
  *
@@ -1716,7 +1838,7 @@ static int insert_page(struct vm_area_struct *vma, unsigned long addr,
 		goto out;
 	retval = -ENOMEM;
 	flush_dcache_page(page);
-	pte = get_locked_pte(mm, addr, &ptl);
+	pte = vma->vm_mm->lazy_repl_enabled ? get_locked_pte_node(mm, addr, &ptl, vma->master_pgd_node) : get_locked_pte(mm, addr, &ptl);
 	if (!pte)
 		goto out;
 	retval = -EBUSY;
@@ -1790,7 +1912,7 @@ static int insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 	spinlock_t *ptl;
 
 	retval = -ENOMEM;
-	pte = get_locked_pte(mm, addr, &ptl);
+	pte = vma->vm_mm->lazy_repl_enabled ? get_locked_pte_node(mm, addr, &ptl, vma->master_pgd_node) : get_locked_pte(mm, addr, &ptl);
 	if (!pte)
 		goto out;
 	retval = -EBUSY;
@@ -2101,7 +2223,7 @@ int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
 
 	BUG_ON(addr >= end);
 	pfn -= addr >> PAGE_SHIFT;
-	pgd = pgd_offset(mm, addr);
+	pgd = mm->lazy_repl_enabled ? pgd_offset_node(mm, addr, vma->master_pgd_node) : pgd_offset(mm, addr);
 	flush_cache_range(vma, addr, end);
 	do {
 		next = pgd_addr_end(addr, end);
@@ -2708,6 +2830,7 @@ static int do_wp_page(struct vm_fault *vmf)
 	__releases(vmf->ptl)
 {
 	struct vm_area_struct *vma = vmf->vma;
+	// printk("writing to shared page\n");
 
 	vmf->page = vm_normal_page(vma, vmf->address, vmf->orig_pte);
 	if (!vmf->page) {
@@ -2882,6 +3005,7 @@ EXPORT_SYMBOL(unmap_mapping_range);
  */
 int do_swap_page(struct vm_fault *vmf)
 {
+	// printk("we're swapping\n");
 	struct vm_area_struct *vma = vmf->vma;
 	struct page *page = NULL, *swapcache;
 	struct mem_cgroup *memcg;
@@ -3102,6 +3226,7 @@ out_release:
  */
 static int do_anonymous_page(struct vm_fault *vmf)
 {
+	// printk("we're doing anon page fault\n");
 	struct vm_area_struct *vma = vmf->vma;
 	struct mem_cgroup *memcg;
 	struct page *page;
@@ -3722,16 +3847,21 @@ static int do_shared_fault(struct vm_fault *vmf)
  */
 static int do_fault(struct vm_fault *vmf)
 {
+	// printk("we're doing a fault!\n");
 	struct vm_area_struct *vma = vmf->vma;
 	int ret;
 
 	/* The VMA was not fully populated on mmap() or missing VM_DONTEXPAND */
 	if (!vma->vm_ops->fault)
 		ret = VM_FAULT_SIGBUS;
-	else if (!(vmf->flags & FAULT_FLAG_WRITE))
+	else if (!(vmf->flags & FAULT_FLAG_WRITE)) {
+		// printk("do read fault\n");
 		ret = do_read_fault(vmf);
-	else if (!(vma->vm_flags & VM_SHARED))
+	}
+	else if (!(vma->vm_flags & VM_SHARED)) {
+		// printk("do cow fault\n");
 		ret = do_cow_fault(vmf);
+	}
 	else
 		ret = do_shared_fault(vmf);
 
@@ -3740,6 +3870,7 @@ static int do_fault(struct vm_fault *vmf)
 		pte_free(vma->vm_mm, vmf->prealloc_pte);
 		vmf->prealloc_pte = NULL;
 	}
+	// printk("we're done doing the fault!\n");
 	return ret;
 }
 
@@ -3901,6 +4032,182 @@ static int wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
 	return VM_FAULT_FALLBACK;
 }
 
+static int find_pte_in_master(struct mm_struct *mm, unsigned long address, int master_node,
+			    pte_t **ptepp, pte_t *pte_origp)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *ptep;
+	spinlock_t *ptl;
+	bool  is_pte_present = true;
+	// printk("checking pte\n");
+	// printk("address is %ld\n", address);
+
+	pgd = pgd_offset_node(mm, address, master_node);
+	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))
+		return 1;
+
+	p4d = p4d_offset(pgd, address);
+	if (p4d_none(*p4d) || unlikely(p4d_bad(*p4d)))
+		return 2;
+
+	pud = pud_offset(p4d, address);
+	if (pud_none(*pud) || unlikely(pud_bad(*pud)))
+		return 3;
+
+	pmd = pmd_offset(pud, address);
+	VM_BUG_ON(pmd_trans_huge(*pmd));
+
+	if (pmd_none(*pmd) || unlikely(pmd_bad(*pmd)))
+		return 4;
+
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	if (!pte_present(*ptep))
+		is_pte_present = false;
+	*pte_origp = *ptep;
+	*ptepp = ptep;
+	pte_unmap_unlock(ptep, ptl);
+
+	if (is_pte_present)
+		return 0;
+	return 5;
+}
+
+static int check_in_repl_list(unsigned long addr, pte_t *pte1, pte_t *pte2) {
+	unsigned int replicas_seen = 1;
+	struct page *page1, *page2, *cur;
+
+	if (!pte1 || !pte2) {
+		BUG();
+	}
+
+	if (pte1 == pte2) {
+		return 1;
+	}
+
+	cur = page1 = virt_to_page((long)pte1);
+	page2 = virt_to_page((long)pte2);
+
+	do {
+		if (replicas_seen == NUMA_NODE_COUNT * 2) {
+			WARN(1, "replicas_seen = %d > NUMA_NODE_COUNT = %d", replicas_seen, NUMA_NODE_COUNT);
+			if (current) {
+				do_hydra_dump_ll(current->mm, addr);
+				do_send_sig_info(SIGKILL, SEND_SIG_FORCED, current, true);
+			}
+			return -1;
+		}
+		cur = cur->next_replica;
+		++replicas_seen;
+		if (cur == page2) {
+			return 1;
+		}
+	} while (cur != page1 && cur);
+
+	if (!page1->next_replica) {
+		page1->next_replica = page1;
+	}
+
+	if (!page2->next_replica) {
+		page2->next_replica = page2;
+	}
+
+	// is this safe? since we are holding both PTLs....
+	swap(page1->next_replica, page2->next_replica);
+	return 0;
+}
+
+/**
+ * try_lazy_repl - check if a pte is present
+ * @mm: mm struct
+ * @address: user virtual address
+ *
+ * Returns zero on success, -ve otherwise.
+ */
+static int try_lazy_repl(struct vm_fault *vmf)
+{
+	int ret, sub_mm_fault_ret = 0;
+	int newly_allocated = 0;
+	size_t current_node = numa_node_id();
+	pte_t *ptep, *pte_src, *pte_dest, mpte_orig, rpte_orig;
+	pmd_t *pmd = vmf->pmd;
+	unsigned long address = vmf->address;
+	unsigned long master_node = vmf->vma->master_pgd_node;
+	unsigned long i, repl_size, pte_address_mask, start_va, end_va;
+	struct mm_struct *mm = vmf->vma->vm_mm;
+
+	BUG_ON(!mm->lazy_repl_enabled);
+	BUG_ON(current_node == master_node);
+
+	ret = find_pte_in_master(mm, address, master_node, &ptep, &mpte_orig);
+	if (ret || ((vmf->flags & FAULT_FLAG_WRITE) && !pte_write(mpte_orig))) {
+		sub_mm_fault_ret = __handle_mm_fault(vmf->vma, vmf->address, vmf->flags, 1);
+		if (sub_mm_fault_ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)) {
+			return sub_mm_fault_ret;
+		}
+		ret = find_pte_in_master(mm, address, master_node, &ptep, &mpte_orig);
+		if (ret) {
+			printk("find_pte %d after fault on master on address %lx; smfr %x\n", ret, address, sub_mm_fault_ret);
+			printk("vmf->pte %px, *vmf->pte %lx\n", vmf->pte, vmf->pte ? vmf->pte->pte : 0);
+			BUG();
+		}
+	}
+
+	// allocate a PT if it doesn't already exist
+	if (!vmf->pte) {
+		ret = __repl_pte_alloc(mm, pmd, address, ptep, current_node);
+		if (ret < 0) {
+			return VM_FAULT_OOM;
+		}
+		newly_allocated = ret == 1;
+		vmf->pte = pte_offset_map(pmd, address);
+	}
+	rpte_orig = *vmf->pte;
+
+	if (newly_allocated && sysctl_hydra_repl_order > 0) {
+		repl_size = 1ul << sysctl_hydra_repl_order;
+		pte_address_mask = ~((repl_size * sizeof(pte_t)) - 1ul);
+		pte_src = (pte_t *)((unsigned long)ptep & pte_address_mask);
+		pte_dest = (pte_t *)((unsigned long)vmf->pte & pte_address_mask);
+
+		start_va = vmf->address & ~((repl_size << PAGE_SHIFT) - 1ul);
+		end_va = start_va + (repl_size << PAGE_SHIFT);
+		if (start_va < vmf->vma->vm_start) {
+			i = (vmf->vma->vm_start - start_va) >> PAGE_SHIFT;
+			pte_src += i;
+			pte_dest += i;
+			repl_size -= i;
+		}
+		if (end_va > vmf->vma->vm_end) {
+			repl_size -= (end_va - vmf->vma->vm_end) >> PAGE_SHIFT;
+		}
+	} else {
+		repl_size = 1;
+	}
+
+	smp_mb();
+	vmf->ptl = pte_lockptr(mm, pmd);
+	spin_lock(vmf->ptl);
+
+	if (check_in_repl_list(address, vmf->pte, ptep) != -1) {
+		if (pte_same(rpte_orig, *vmf->pte)) {
+			smp_mb();
+			if (repl_size == 1) {
+				native_set_pte(vmf->pte, *ptep);
+			} else {
+				memcpy(pte_dest, pte_src, repl_size * sizeof(pte_t));
+			}
+		}
+	} else {
+		sub_mm_fault_ret = VM_FAULT_SIGSEGV;
+	}
+
+	pte_unmap_unlock(vmf->pte, vmf->ptl);
+	return sub_mm_fault_ret;
+}
+
 /*
  * These routines also need to handle stuff like marking pages dirty
  * and/or accessed for architectures that don't do it in hardware (most
@@ -3916,9 +4223,12 @@ static int wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
  * The mmap_sem may have been released depending on flags and our return value.
  * See filemap_fault() and __lock_page_or_retry().
  */
-static int handle_pte_fault(struct vm_fault *vmf)
+static int handle_pte_fault(struct vm_fault *vmf, int has_recursed)
 {
 	pte_t entry;
+
+	// printk("--PTE FAULT--\n");
+	// printk("address is %ld\n", vmf->address);
 
 	if (unlikely(pmd_none(*vmf->pmd))) {
 		/*
@@ -3956,6 +4266,10 @@ static int handle_pte_fault(struct vm_fault *vmf)
 		}
 	}
 
+	if (vmf->vma->vm_mm->lazy_repl_enabled && !has_recursed && numa_node_id() != vmf->vma->master_pgd_node) {
+		return try_lazy_repl(vmf);
+	}
+
 	if (!vmf->pte) {
 		if (vma_is_anonymous(vmf->vma))
 			return do_anonymous_page(vmf);
@@ -3963,12 +4277,14 @@ static int handle_pte_fault(struct vm_fault *vmf)
 			return do_fault(vmf);
 	}
 
-	if (!pte_present(vmf->orig_pte))
+	if (!pte_present(vmf->orig_pte)) {
 		return do_swap_page(vmf);
+	}
 
 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
 		return do_numa_page(vmf);
 
+//carry_on:
 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
 	spin_lock(vmf->ptl);
 	entry = vmf->orig_pte;
@@ -3978,11 +4294,13 @@ static int handle_pte_fault(struct vm_fault *vmf)
 		if (!pte_write(entry))
 			return do_wp_page(vmf);
 		entry = pte_mkdirty(entry);
+		// printk("dirty\n");
 	}
 	entry = pte_mkyoung(entry);
 	if (ptep_set_access_flags(vmf->vma, vmf->address, vmf->pte, entry,
 				vmf->flags & FAULT_FLAG_WRITE)) {
 		update_mmu_cache(vmf->vma, vmf->address, vmf->pte);
+		// printk("mmu cache update\n");
 	} else {
 		/*
 		 * This is needed only for protection faults but the arch code
@@ -3990,13 +4308,16 @@ static int handle_pte_fault(struct vm_fault *vmf)
 		 * This still avoids useless tlb flushes for .text page faults
 		 * with threads.
 		 */
-		if (vmf->flags & FAULT_FLAG_WRITE)
+		if (vmf->flags & FAULT_FLAG_WRITE) {
 			flush_tlb_fix_spurious_fault(vmf->vma, vmf->address);
+			// printk("spurious fault\n");
+		}
 	}
 unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 	return 0;
 }
+
 
 /*
  * By the time we get here, we already hold the mm semaphore
@@ -4004,8 +4325,8 @@ unlock:
  * The mmap_sem may have been released depending on flags and our
  * return value.  See filemap_fault() and __lock_page_or_retry().
  */
-static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
-		unsigned int flags)
+int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+		unsigned int flags, int use_master)
 {
 	struct vm_fault vmf = {
 		.vma = vma,
@@ -4018,14 +4339,23 @@ static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	struct mm_struct *mm = vma->vm_mm;
 	pgd_t *pgd;
 	p4d_t *p4d;
+	size_t node_to_use = use_master ? vma->master_pgd_node : numa_node_id();
 	int ret;
 
-	pgd = pgd_offset(mm, address);
-	p4d = p4d_alloc(mm, pgd, address);
-	if (!p4d)
-		return VM_FAULT_OOM;
+	if (mm->lazy_repl_enabled) {
+		pgd = pgd_offset_node(mm, address, node_to_use);
+		p4d = repl_p4d_alloc(mm, pgd, address, node_to_use);
+		if (!p4d)
+			return VM_FAULT_OOM;
+		vmf.pud = repl_pud_alloc(mm, p4d, address, node_to_use);
+	} else {
+		pgd = pgd_offset(mm, address);
+		p4d = p4d_alloc(mm, pgd, address);
+		if (!p4d)
+			return VM_FAULT_OOM;
+		vmf.pud = pud_alloc(mm, p4d, address);
+	}
 
-	vmf.pud = pud_alloc(mm, p4d, address);
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
 	if (pud_none(*vmf.pud) && transparent_hugepage_enabled(vma)) {
@@ -4051,7 +4381,12 @@ static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 		}
 	}
 
-	vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+	if (mm->lazy_repl_enabled) {
+		vmf.pmd = repl_pmd_alloc(mm, vmf.pud, address, node_to_use);
+	} else {
+		vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+	}
+
 	if (!vmf.pmd)
 		return VM_FAULT_OOM;
 	if (pmd_none(*vmf.pmd) && transparent_hugepage_enabled(vma)) {
@@ -4084,7 +4419,7 @@ static int __handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 		}
 	}
 
-	return handle_pte_fault(&vmf);
+	return handle_pte_fault(&vmf, use_master);
 }
 
 /*
@@ -4121,7 +4456,7 @@ int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
 	else
-		ret = __handle_mm_fault(vma, address, flags);
+		ret = __handle_mm_fault(vma, address, flags, 0);
 
 	if (flags & FAULT_FLAG_USER) {
 		mem_cgroup_oom_disable();
@@ -4160,6 +4495,24 @@ int __p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
 	spin_unlock(&mm->page_table_lock);
 	return 0;
 }
+
+int __repl_p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address, size_t nid)
+{
+	p4d_t *new = repl_p4d_alloc_one(mm, address, nid);
+	if (!new)
+		return -ENOMEM;
+
+	smp_wmb(); /* See comment in __pte_alloc */
+
+	spin_lock(&mm->page_table_lock);
+	if (pgd_present(*pgd))		/* Another has populated it */
+		p4d_free(mm, new);
+	else
+		pgd_populate(mm, pgd, new);
+	spin_unlock(&mm->page_table_lock);
+	return 0;
+}
+
 #endif /* __PAGETABLE_P4D_FOLDED */
 
 #ifndef __PAGETABLE_PUD_FOLDED
@@ -4170,6 +4523,32 @@ int __p4d_alloc(struct mm_struct *mm, pgd_t *pgd, unsigned long address)
 int __pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address)
 {
 	pud_t *new = pud_alloc_one(mm, address);
+	if (!new)
+		return -ENOMEM;
+
+	smp_wmb(); /* See comment in __pte_alloc */
+
+	spin_lock(&mm->page_table_lock);
+#ifndef __ARCH_HAS_5LEVEL_HACK
+	if (!p4d_present(*p4d)) {
+		mm_inc_nr_puds(mm);
+		p4d_populate(mm, p4d, new);
+	} else	/* Another has populated it */
+		pud_free(mm, new);
+#else
+	if (!pgd_present(*p4d)) {
+		mm_inc_nr_puds(mm);
+		pgd_populate(mm, p4d, new);
+	} else	/* Another has populated it */
+		pud_free(mm, new);
+#endif /* __ARCH_HAS_5LEVEL_HACK */
+	spin_unlock(&mm->page_table_lock);
+	return 0;
+}
+
+int __repl_pud_alloc(struct mm_struct *mm, p4d_t *p4d, unsigned long address, size_t nid)
+{
+	pud_t *new = repl_pud_alloc_one(mm, address, nid);
 	if (!new)
 		return -ENOMEM;
 
@@ -4225,6 +4604,34 @@ int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
 	spin_unlock(ptl);
 	return 0;
 }
+
+int __repl_pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address, size_t nid)
+{
+	spinlock_t *ptl;
+	pmd_t *new = repl_pmd_alloc_one(mm, address, nid);
+	if (!new)
+		return -ENOMEM;
+
+	smp_wmb(); /* See comment in __pte_alloc */
+
+	ptl = pud_lock(mm, pud);
+#ifndef __ARCH_HAS_4LEVEL_HACK
+	if (!pud_present(*pud)) {
+		mm_inc_nr_pmds(mm);
+		pud_populate(mm, pud, new);
+	} else	/* Another has populated it */
+		pmd_free(mm, new);
+#else
+	if (!pgd_present(*pud)) {
+		mm_inc_nr_pmds(mm);
+		pgd_populate(mm, pud, new);
+	} else /* Another has populated it */
+		pmd_free(mm, new);
+#endif /* __ARCH_HAS_4LEVEL_HACK */
+	spin_unlock(ptl);
+	return 0;
+}
+
 #endif /* __PAGETABLE_PMD_FOLDED */
 
 static int __follow_pte_pmd(struct mm_struct *mm, unsigned long address,

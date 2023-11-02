@@ -416,8 +416,8 @@ struct pv_mmu_ops pv_mmu_ops __ro_after_init = {
 	.release_pud = paravirt_nop,
 	.release_p4d = paravirt_nop,
 
-	.set_pte = native_set_pte,
-	.set_pte_at = native_set_pte_at,
+	.set_pte = pgtable_repl_set_pte,
+	.set_pte_at = pgtable_repl_set_pte_at,
 	.set_pmd = native_set_pmd,
 
 	.ptep_modify_prot_start = __ptep_modify_prot_start,

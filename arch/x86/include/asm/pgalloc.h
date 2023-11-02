@@ -45,13 +45,25 @@ extern gfp_t __userpte_alloc_gfp;
  * Allocate and free page tables.
  */
 extern pgd_t *pgd_alloc(struct mm_struct *);
+extern pgd_t *repl_pgd_alloc(struct mm_struct *, size_t node_id);
 extern void pgd_free(struct mm_struct *mm, pgd_t *pgd);
 
 extern pte_t *pte_alloc_one_kernel(struct mm_struct *, unsigned long);
 extern pgtable_t pte_alloc_one(struct mm_struct *, unsigned long);
+extern pgtable_t repl_pte_alloc_one(struct mm_struct *, unsigned long, size_t node_id);
 
 /* Should really implement gc for free page table pages. This could be
    done with a reference count in struct page. */
+
+static inline struct page * repl_alloc_page_on_node(size_t nid, unsigned int order)
+{
+	nodemask_t nm = NODE_MASK_NONE;
+	struct page *p;
+
+	node_set(nid, nm);
+	p = __alloc_pages_nodemask((GFP_KERNEL_ACCOUNT | __GFP_ZERO), order, nid, &nm);
+	return p;
+}
 
 static inline void pte_free_kernel(struct mm_struct *mm, pte_t *pte)
 {
@@ -109,6 +121,20 @@ static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long addr)
 	return (pmd_t *)page_address(page);
 }
 
+static inline pmd_t *repl_pmd_alloc_one(struct mm_struct *mm, unsigned long addr, size_t nid)
+{
+	struct page *page;
+
+	page = repl_alloc_page_on_node(nid, 0);
+	if (!page)
+		return NULL;
+	if (!pgtable_pmd_page_ctor(page)) {
+		__free_pages(page, 0);
+		return NULL;
+	}
+	return (pmd_t *)page_address(page);
+}
+
 static inline void pmd_free(struct mm_struct *mm, pmd_t *pmd)
 {
 	BUG_ON((unsigned long)pmd & (PAGE_SIZE-1));
@@ -150,6 +176,11 @@ static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long addr)
 	return (pud_t *)get_zeroed_page(gfp);
 }
 
+static inline pud_t *repl_pud_alloc_one(struct mm_struct *mm, unsigned long addr, size_t nid)
+{
+	return (pud_t *) page_address(repl_alloc_page_on_node(nid, 0));
+}
+
 static inline void pud_free(struct mm_struct *mm, pud_t *pud)
 {
 	BUG_ON((unsigned long)pud & (PAGE_SIZE-1));
@@ -180,6 +211,11 @@ static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
 	if (mm == &init_mm)
 		gfp &= ~__GFP_ACCOUNT;
 	return (p4d_t *)get_zeroed_page(gfp);
+}
+
+static inline p4d_t *repl_p4d_alloc_one(struct mm_struct *mm, unsigned long addr, size_t nid)
+{
+	return (p4d_t *) page_address(repl_alloc_page_on_node(nid, 0));
 }
 
 static inline void p4d_free(struct mm_struct *mm, p4d_t *p4d)

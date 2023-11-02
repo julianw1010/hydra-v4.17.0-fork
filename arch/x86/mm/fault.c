@@ -927,7 +927,6 @@ __bad_area(struct pt_regs *regs, unsigned long error_code,
 	 * Fix it, but check if it's kernel or user first..
 	 */
 	up_read(&mm->mmap_sem);
-
 	__bad_area_nosemaphore(regs, error_code, address,
 			       (vma) ? &pkey : NULL, si_code);
 }
@@ -1029,8 +1028,9 @@ mm_fault_error(struct pt_regs *regs, unsigned long error_code,
 		if (fault & (VM_FAULT_SIGBUS|VM_FAULT_HWPOISON|
 			     VM_FAULT_HWPOISON_LARGE))
 			do_sigbus(regs, error_code, address, pkey, fault);
-		else if (fault & VM_FAULT_SIGSEGV)
+		else if (fault & VM_FAULT_SIGSEGV) {
 			bad_area_nosemaphore(regs, error_code, address, pkey);
+		}
 		else
 			BUG();
 	}
@@ -1226,9 +1226,18 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	mm = tsk->mm;
 
 	prefetchw(&mm->mmap_sem);
+	// printk("address = %ld\n", address);
+	// printk("fault in kernel space = %d\n", fault_in_kernel_space(address));
+	// printk("X86_PF_PROT: %ld\n", (error_code & X86_PF_PROT));
+	// printk("X86_PF_WRITE: %ld\n", (error_code & X86_PF_WRITE));
+	// printk("X86_PF_USER: %ld\n", (error_code & X86_PF_USER));
+	// printk("X86_PF_RSVD: %ld\n", (error_code & X86_PF_RSVD));
+	// printk("X86_PF_INSTR: %ld\n", (error_code & X86_PF_INSTR));
+	// printk("X86_PF_PK: %ld\n\n", (error_code & X86_PF_PK));
 
-	if (unlikely(kmmio_fault(regs, address)))
+	if (unlikely(kmmio_fault(regs, address))) {
 		return;
+	}
 
 	/*
 	 * We fault-in kernel-space virtual memory on-demand. The
@@ -1266,11 +1275,13 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	}
 
 	/* kprobes don't want to hook the spurious faults: */
-	if (unlikely(kprobes_fault(regs)))
+	if (unlikely(kprobes_fault(regs))) {
 		return;
+	}
 
-	if (unlikely(error_code & X86_PF_RSVD))
+	if (unlikely(error_code & X86_PF_RSVD)) {
 		pgtable_bad(regs, error_code, address);
+	}
 
 	if (unlikely(smap_violation(error_code, regs))) {
 		bad_area_nosemaphore(regs, error_code, address, NULL);
@@ -1350,6 +1361,7 @@ retry:
 	if (likely(vma->vm_start <= address))
 		goto good_area;
 	if (unlikely(!(vma->vm_flags & VM_GROWSDOWN))) {
+		// printk("exit bad\n");
 		bad_area(regs, error_code, address);
 		return;
 	}

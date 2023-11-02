@@ -4392,6 +4392,8 @@ out:
 
 	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype);
 
+	if (page) page->next_replica = NULL;
+
 	return page;
 }
 EXPORT_SYMBOL(__alloc_pages_nodemask);
@@ -4424,6 +4426,7 @@ EXPORT_SYMBOL(get_zeroed_page);
 
 void __free_pages(struct page *page, unsigned int order)
 {
+	page->next_replica = NULL;
 	if (put_page_testzero(page)) {
 		if (order == 0)
 			free_unref_page(page);

@@ -753,3 +753,11 @@ config GUP_BENCHMARK
 	  performance of get_user_pages_fast().
 
 	  See tools/testing/selftests/vm/gup_benchmark.c
+
+config HYDRA_NUMA_NODES
+	int "Number of NUMA nodes (for Hydra)"
+	default 2
+
+config HYDRA_TLB_STATISTICS
+	bool "Enable Hydra TLB shootdown statistics"
+	default n

@@ -377,6 +377,27 @@ static const struct file_operations proc_pid_cmdline_ops = {
 	.llseek	= generic_file_llseek,
 };
 
+#ifdef CONFIG_HYDRA_TLB_STATISTICS
+static int proc_hydra(struct seq_file *m, struct pid_namespace *ns,
+			struct pid *pid, struct task_struct *task)
+{
+	struct mm_struct *mm = get_task_mm(task);
+	s64 sent, total, total2, nodes;
+	if (mm) {
+		sent = atomic64_read(&mm->xx_tlb_sent);
+		total = atomic64_read(&mm->xx_tlb_total);
+		total2 = atomic64_read(&mm->xx_flush_total);
+		nodes = atomic64_read(&mm->xx_flush_nodes);
+		mmput(mm);
+		seq_put_decimal_ll(m, NULL, sent);
+		seq_put_decimal_ll(m, " ", total);
+		seq_put_decimal_ll(m, " ", total2);
+		seq_put_decimal_ll(m, " ", nodes);
+	}
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_KALLSYMS
 /*
  * Provides a wchan file via kallsyms in a proper one-value-per-file format.
@@ -2942,6 +2963,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("environ",    S_IRUSR, proc_environ_operations),
 	REG("auxv",       S_IRUSR, proc_auxv_operations),
 	ONE("status",     S_IRUGO, proc_pid_status),
+#ifdef CONFIG_HYDRA_TLB_STATISTICS
+	ONE("hydra",      S_IRUGO, proc_hydra),
+#endif
 	ONE("personality", S_IRUSR, proc_pid_personality),
 	ONE("limits",	  S_IRUGO, proc_pid_limits),
 #ifdef CONFIG_SCHED_DEBUG

@@ -7,6 +7,10 @@
 #include <linux/export.h>
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
+#include <linux/signal.h>
+#include <linux/sched/signal.h>
+#include <linux/hydra_debug.h>
+#include <linux/hydra_util.h>
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
@@ -155,7 +159,7 @@ void switch_mm(struct mm_struct *prev, struct mm_struct *next,
 static void sync_current_stack_to_mm(struct mm_struct *mm)
 {
 	unsigned long sp = current_stack_pointer;
-	pgd_t *pgd = pgd_offset(mm, sp);
+	pgd_t *pgd = mm->lazy_repl_enabled ? pgd_offset_node(mm, sp, numa_node_id()) : pgd_offset(mm, sp);
 
 	if (pgtable_l5_enabled) {
 		if (unlikely(pgd_none(*pgd))) {
@@ -184,9 +188,11 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			struct task_struct *tsk)
 {
 	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
+	pgd_t* next_pgd;
 	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
 	unsigned cpu = smp_processor_id();
 	u64 next_tlb_gen;
+	size_t nid = 0;
 
 	/*
 	 * NB: The scheduler will call us with prev == next when switching
@@ -210,7 +216,8 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * Only do this check if CONFIG_DEBUG_VM=y because __read_cr3()
 	 * isn't free.
 	 */
-#ifdef CONFIG_DEBUG_VM
+	// Hydra: disable this check
+#if 0
 	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid))) {
 		/*
 		 * If we were to BUG here, we'd be very likely to kill
@@ -235,7 +242,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 	 * storing to rq->curr. Writing to CR3 provides that full
 	 * memory barrier and core serializing instruction.
 	 */
-	if (real_prev == next) {
+	if (real_prev == next)  {
 		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[prev_asid].ctx_id) !=
 			   next->context.ctx_id);
 
@@ -298,10 +305,16 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 
 		choose_new_asid(next, next_tlb_gen, &new_asid, &need_flush);
 
+		if (next->lazy_repl_enabled) {
+			next_pgd = next->repl_pgd[numa_node_id()];
+		} else {
+			next_pgd = next->pgd;
+		}
+
 		if (need_flush) {
 			this_cpu_write(cpu_tlbstate.ctxs[new_asid].ctx_id, next->context.ctx_id);
 			this_cpu_write(cpu_tlbstate.ctxs[new_asid].tlb_gen, next_tlb_gen);
-			load_new_mm_cr3(next->pgd, new_asid, true);
+			load_new_mm_cr3(next_pgd, new_asid, true);
 
 			/*
 			 * NB: This gets called via leave_mm() in the idle path
@@ -314,7 +327,7 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 			trace_tlb_flush_rcuidle(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
 		} else {
 			/* The new ASID is already up to date. */
-			load_new_mm_cr3(next->pgd, new_asid, false);
+			load_new_mm_cr3(next_pgd, new_asid, false);
 
 			/* See above wrt _rcuidle. */
 			trace_tlb_flush_rcuidle(TLB_FLUSH_ON_TASK_SWITCH, 0);
@@ -608,10 +621,14 @@ void native_flush_tlb_others(const struct cpumask *cpumask,
  */
 static unsigned long tlb_single_page_flush_ceiling __read_mostly = 33;
 
-void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
-				unsigned long end, unsigned long vmflag)
+void flush_tlb_mm_node_range(struct mm_struct *mm, unsigned long start,
+				unsigned long end, unsigned long vmflag, nodemask_t *nodemask)
 {
-	int cpu;
+	int cpu, node;
+	cpumask_t flush_mask;
+	cpumask_t mm_mask;
+	cpumask_clear(&flush_mask);
+	cpumask_clear(&mm_mask);
 
 	struct flush_tlb_info info __aligned(SMP_CACHE_BYTES) = {
 		.mm = mm,
@@ -633,6 +650,17 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 		info.end = TLB_FLUSH_ALL;
 	}
 
+	cpumask_copy(&mm_mask, mm_cpumask(mm));
+
+	if (mm->lazy_repl_enabled && sysctl_hydra_tlbflush_opt && nodemask) {
+		for_each_node_mask(node, *nodemask) {
+			cpumask_or(&flush_mask, &flush_mask, cpumask_of_node(node));
+		}
+		cpumask_and(&flush_mask, &flush_mask, &mm_mask);
+	} else {
+		cpumask_copy(&flush_mask, &mm_mask);
+	}
+
 	if (mm == this_cpu_read(cpu_tlbstate.loaded_mm)) {
 		VM_WARN_ON(irqs_disabled());
 		local_irq_disable();
@@ -640,12 +668,46 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 		local_irq_enable();
 	}
 
-	if (cpumask_any_but(mm_cpumask(mm), cpu) < nr_cpu_ids)
-		flush_tlb_others(mm_cpumask(mm), &info);
+#ifdef CONFIG_HYDRA_TLB_STATISTICS
+	if (mm->lazy_repl_enabled && sysctl_hydra_tlbflush_opt) {
+		atomic64_add(cpumask_weight(&mm_mask), &mm->xx_tlb_total);
+		atomic64_add(nodemask ? nodes_weight(*nodemask) : num_online_nodes(), &mm->xx_flush_nodes);
+		atomic64_inc(&mm->xx_flush_total);
+	}
+#endif
+
+	if (cpumask_any_but(&flush_mask, cpu) < nr_cpu_ids) {
+		flush_tlb_others(&flush_mask, &info);
+
+#ifdef CONFIG_HYDRA_TLB_STATISTICS
+		if (mm->lazy_repl_enabled && sysctl_hydra_tlbflush_opt) {
+			atomic64_add(cpumask_weight(&flush_mask), &mm->xx_tlb_sent);
+		}
+#endif
+	}
 
 	put_cpu();
 }
 
+void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+				unsigned long end, unsigned long vmflag) {
+	flush_tlb_mm_node_range(mm, start, end, vmflag, NULL);
+}
+
+void flush_tlb_vma_range(struct vm_area_struct *vma, unsigned long start,
+				unsigned long end, unsigned long vmflag) {
+	nodemask_t nodemask;
+	if (vma->vm_mm->lazy_repl_enabled && ((start >> PMD_SHIFT) == (end >> PMD_SHIFT))) {
+		pte_t *pte = hydra_find_pte(vma->vm_mm, start, vma->master_pgd_node);
+		if (!HYDRA_FIND_BAD(pte)) {
+			nodes_clear(nodemask);
+			hydra_calculate_tlbflush_nodemask(virt_to_page(pte), &nodemask);
+			flush_tlb_mm_node_range(vma->vm_mm, start, end, vmflag, &nodemask);
+			return;
+		}
+	}
+	flush_tlb_mm_node_range(vma->vm_mm, start, end, vmflag, NULL);
+}
 
 static void do_flush_tlb_all(void *info)
 {
@@ -754,3 +816,5 @@ static int __init create_tlb_single_page_flush_ceiling(void)
 	return 0;
 }
 late_initcall(create_tlb_single_page_flush_ceiling);
+
+int sysctl_hydra_tlbflush_opt __read_mostly = 0;

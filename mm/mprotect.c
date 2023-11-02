@@ -70,6 +70,9 @@ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
 	arch_enter_lazy_mmu_mode();
 	do {
 		oldpte = *pte;
+		if (mm->lazy_repl_enabled && ((virt_to_page(pte))->next_replica)) {
+				oldpte = pgtable_repl_get_pte(pte);
+		}
 		if (pte_present(oldpte)) {
 			pte_t ptent;
 			bool preserve_write = prot_numa && pte_write(oldpte);
@@ -273,7 +276,11 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
 	unsigned long pages = 0;
 
 	BUG_ON(addr >= end);
-	pgd = pgd_offset(mm, addr);
+	if (mm->lazy_repl_enabled) {
+		pgd = pgd_offset_node(mm, addr, vma->master_pgd_node);
+	} else {
+		pgd = pgd_offset(mm, addr);
+	}
 	flush_cache_range(vma, addr, end);
 	inc_tlb_flush_pending(mm);
 	do {
@@ -300,9 +307,9 @@ unsigned long change_protection(struct vm_area_struct *vma, unsigned long start,
 
 	if (is_vm_hugetlb_page(vma))
 		pages = hugetlb_change_protection(vma, start, end, newprot);
-	else
+	else 
 		pages = change_protection_range(vma, start, end, newprot, dirty_accountable, prot_numa);
-
+		
 	return pages;
 }
 

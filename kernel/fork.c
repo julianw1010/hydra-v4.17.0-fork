@@ -508,8 +508,9 @@ static __latent_entropy int dup_mmap(struct mm_struct *mm,
 		rb_parent = &tmp->vm_rb;
 
 		mm->map_count++;
-		if (!(tmp->vm_flags & VM_WIPEONFORK))
+		if (!(tmp->vm_flags & VM_WIPEONFORK)) {
 			retval = copy_page_range(mm, oldmm, mpnt);
+		}
 
 		if (tmp->vm_ops && tmp->vm_ops->open)
 			tmp->vm_ops->open(tmp);
@@ -548,7 +549,10 @@ static inline int mm_alloc_pgd(struct mm_struct *mm)
 
 static inline void mm_free_pgd(struct mm_struct *mm)
 {
-	pgd_free(mm, mm->pgd);
+	int i;
+	for (i = 0; i < NUMA_NODE_COUNT; i++) {
+		pgd_free(mm, mm->repl_pgd[i]);
+	}
 }
 #else
 static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
@@ -885,11 +889,18 @@ static void mm_init_uprobes_state(struct mm_struct *mm)
 static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	struct user_namespace *user_ns)
 {
+	int i;
 	mm->mmap = NULL;
 	mm->mm_rb = RB_ROOT;
 	mm->vmacache_seqnum = 0;
 	atomic_set(&mm->mm_users, 1);
 	atomic_set(&mm->mm_count, 1);
+#ifdef CONFIG_HYDRA_TLB_STATISTICS
+	atomic64_set(&mm->xx_tlb_sent, 0);
+	atomic64_set(&mm->xx_tlb_total, 0);
+	atomic64_set(&mm->xx_flush_total, 0);
+	atomic64_set(&mm->xx_flush_nodes, 0);
+#endif
 	init_rwsem(&mm->mmap_sem);
 	INIT_LIST_HEAD(&mm->mmlist);
 	mm->core_state = NULL;
@@ -914,9 +925,13 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	if (current->mm) {
 		mm->flags = current->mm->flags & MMF_INIT_MASK;
 		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
+		mm->lazy_repl_enabled = current->mm->lazy_repl_enabled;
+		mm->va_segregation_mode = current->mm->va_segregation_mode;
 	} else {
 		mm->flags = default_dump_filter;
 		mm->def_flags = 0;
+		mm->lazy_repl_enabled = false;
+		mm->va_segregation_mode = 0;
 	}
 
 	if (mm_alloc_pgd(mm))
@@ -926,6 +941,12 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		goto fail_nocontext;
 
 	mm->user_ns = get_user_ns(user_ns);
+
+	mm->repl_pgd[0] = mm->pgd;
+	for (i=1; i < NUMA_NODE_COUNT; i++) {
+		mm->repl_pgd[i] = repl_pgd_alloc(mm, i);
+	}
+
 	return mm;
 
 fail_nocontext:
@@ -952,7 +973,16 @@ struct mm_struct *mm_alloc(void)
 
 static inline void __mmput(struct mm_struct *mm)
 {
+	int i;
 	VM_BUG_ON(atomic_read(&mm->mm_users));
+
+	// if (mm->lazy_repl_enabled) {
+	// 	for (i = 0; i < NR_MM_COUNTERS; i++) {
+	// 		long x = atomic_long_read(&mm->rss_stat.count[i]);
+
+	// 		printk("rss-counter state before mmdrop is mm:%p idx:%d val:%ld\n", mm, i, x);
+	// 	}
+	// }
 
 	uprobe_clear_state(mm);
 	exit_aio(mm);

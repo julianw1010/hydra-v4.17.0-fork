@@ -8,9 +8,11 @@
 
 #define tlb_flush(tlb)							\
 {									\
-	if (!tlb->fullmm && !tlb->need_flush_all) 			\
-		flush_tlb_mm_range(tlb->mm, tlb->start, tlb->end, 0UL);	\
-	else								\
+	if (!tlb->fullmm && !tlb->need_flush_all) {			\
+		if (tlb->collect_nodemask) flush_tlb_mm_node_range(tlb->mm, tlb->start, tlb->end, 0UL, &tlb->nodemask); \
+		else if (tlb->vma) flush_tlb_vma_range(tlb->vma, tlb->start, tlb->end, 0UL);	\
+		else flush_tlb_mm_range(tlb->mm, tlb->start, tlb->end, 0UL); \
+	} else								\
 		flush_tlb_mm_range(tlb->mm, 0UL, TLB_FLUSH_ALL, 0UL);	\
 }
 
